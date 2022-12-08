@@ -105,10 +105,40 @@ function Invoke-Retry() {
     $ErrorActionPreference = $ErrorActionPreferenceToRestore
 }
 
+function Get-OfferType ($subId) {
+    $azContext = Invoke-Retry { Get-AzContext }
+    $azProfile = [Microsoft.Azure.Commands.Common.Authentication.Abstractions.AzureRmProfileProvider]::Instance.Profile
+    $profileClient = New-Object -TypeName Microsoft.Azure.Commands.ResourceManager.Common.RMProfileClient -ArgumentList ($azProfile)
+    $token = $profileClient.AcquireAccessToken($azContext.Subscription.TenantId)
+    $authHeader = @{
+        'Content-Type'='application/json'
+        'Authorization'='Bearer ' + $token.AccessToken
+    }
+    
+    # Invoke the REST API
+    $restUri = "https://management.azure.com/subscriptions/$subId/providers/Microsoft.Consumption/pricesheets/default?api-version=2021-10-01&`$top=50"
+    # $restUri = "https://management.azure.com/subscriptions/$subId/providers/Microsoft.Consumption/usageDetails?api-version=2021-10-01&`$top=50"
+    $response = Invoke-Retry { Invoke-RestMethod -Uri $restUri -Method Get -Headers $authHeader }
+    $offerId = $response.properties.pricesheets.offerid | Sort-Object -Unique
 
-$subs = Invoke-Retry { Get-AzSubscription } | Where-Object { $_.name -match ".*(((jmd|app|ss|gc.)\d+)| 05|ProdCustomerApps|TestDevQa|DevTestQa|Shared Services|Microsoft Azure Enterprise|AD Team).*" }
+    if ((-not $offerId) -or ($offerId.Count -ne 1)) {
+        Write-Error "Invalid Offer Id - $offerId" -ErrorAction Stop
+    } 
+
+    return $offerId
+}
+
+
+
+
+$subs = Invoke-Retry { Get-AzSubscription } | Where-Object { $_.name -match ".*(((jmd|app|ss|gc.|gus.)\d+)| 05|ProdCustomerApps|TestDevQa|DevTestQa|Shared Services|Microsoft Azure Enterprise|AD Team).*" -and $_.state -eq "Enabled" }
 foreach ($sub in $subs ) {
     Invoke-Retry { Select-AzSubscription -SubscriptionName $sub.Name }
+
+    $tenant = Invoke-Retry { (Get-AzTenant -TenantId (Get-AzContext).Tenant).Name }
+    Write-Output "Getting offerId"
+    $offerId = Get-OfferType -subId $sub.Id
+    Write-Output "offerId: $offerId"
 
     # note
     # having issues with too many API calls resulting in odd HTTP errors, so.. breaking things up a bit, using a retry function, and should give more visibility if we need to troubleshoot
@@ -132,9 +162,11 @@ foreach ($sub in $subs ) {
 
         # get the properties of the Az SQL database..
         $tmpResult = Invoke-Retry { Get-AzSqlDatabase -DatabaseName $dbDatabaseName -ServerName $dbServerName -ResourceGroupName $dbResource.ResourceGroupName }
-        $tmpResult | Add-Member  -MemberType NoteProperty -Name SubscriptionId          -Value $sub.id
-        $tmpResult | Add-Member  -MemberType NoteProperty -Name SubscriptionName        -Value $sub.name
-        $tmpResult | Add-Member  -MemberType NoteProperty -Name IsAhbEnabled            -Value (Get-SqlAhb -Sql $tmpResult)
+        $tmpResult | Add-Member -MemberType NoteProperty -Name Tenant                   -Value $tenant
+        $tmpResult | Add-Member -MemberType NoteProperty -Name OfferId                  -Value $offerId
+        $tmpResult | Add-Member -MemberType NoteProperty -Name SubscriptionId           -Value $sub.id
+        $tmpResult | Add-Member -MemberType NoteProperty -Name SubscriptionName         -Value $sub.name
+        $tmpResult | Add-Member -MemberType NoteProperty -Name IsAhbEnabled             -Value (Get-SqlAhb -Sql $tmpResult)
 
         $tmpResult | Add-Member -MemberType NoteProperty -Name TagBillTo                -Value $dbResource.Tags.BillTo
         $tmpResult | Add-Member -MemberType NoteProperty -Name TagDevTeam               -Value $dbResource.Tags.DevTeam
@@ -146,7 +178,6 @@ foreach ($sub in $subs ) {
         $dbs += $tmpResult
     }
 
-
     # get all the Az SQL Elastic Pools
     $poolResources = Invoke-Retry { Get-AzResource -ResourceType "Microsoft.Sql/servers/elasticpools" }
     # add details we need to these objects
@@ -155,6 +186,8 @@ foreach ($sub in $subs ) {
         $poolElasticPoolName = ($poolResource.Name).split('/')[1]
 
         $tmpResult = Invoke-Retry { Get-AzSqlElasticPool -ElasticPoolName $poolElasticPoolName -ServerName $poolServerName -ResourceGroupName $poolResource.ResourceGroupName }
+        $tmpResult | Add-Member -MemberType NoteProperty -Name Tenant                   -Value $tenant
+        $tmpResult | Add-Member -MemberType NoteProperty -Name OfferId                  -Value $offerId
         $tmpResult | Add-Member -MemberType NoteProperty -Name SubscriptionId           -Value $sub.id
         $tmpResult | Add-Member -MemberType NoteProperty -Name SubscriptionName         -Value $sub.name
         $tmpResult | Add-Member -MemberType NoteProperty -Name IsAhbEnabled             -Value (Get-SqlAhb -Sql $tmpResult)
@@ -168,10 +201,14 @@ foreach ($sub in $subs ) {
         
         $pools += $tmpResult
     }
- 
+
+
     foreach ($vm in Invoke-Retry { Get-AzVM }) {
+        $vm | Add-Member -MemberType NoteProperty -Name Tenant                  -Value $tenant
+        $vm | Add-Member -MemberType NoteProperty -Name OfferId                 -Value $offerId
         $vm | Add-Member -MemberType NoteProperty -Name SubscriptionId          -Value $sub.id
         $vm | Add-Member -MemberType NoteProperty -Name SubscriptionName        -Value $sub.name
+        $vm | Add-Member -MemberType NoteProperty -Name VmSize                  -Value $vm.HardwareProfile.VmSize
         $vm | Add-Member -MemberType NoteProperty -Name CoreCount               -Value (Get-VmCores -vmSize $vm.HardwareProfile.VmSize -vmLocation $vm.Location)
         $vm | Add-Member -MemberType NoteProperty -Name OsType                  -Value $vm.StorageProfile.OsDisk.OsType
         $vm | Add-Member -MemberType NoteProperty -Name IsAhbEnabled            -Value (Get-VmAhb -Vm $vm)
@@ -187,9 +224,9 @@ foreach ($sub in $subs ) {
     }           
 }
  
-
-$vms    | Select-Object -Property SubscriptionId, SubscriptionName, ResourceGroupName, Location, Name, CoreCount, LicenseType, OsType, IsAhbEnabled, TagBillTo, TagDevTeam, TagEnvironmentName, TagPurpose, TagSubEnvironmentName, TagAll -ExcludeProperty HardwareProfile | Export-Csv -Path "C:\temp\VMs.csv" -NoTypeInformation -Force
-$dbs    | Select-Object -Property SubscriptionId, SubscriptionName, ResourceGroupName, Location, ServerName, DatabaseName, Edition, SkuName, ElasticPoolName, CurrentServiceObjectiveName, Capacity, LicenseType, IsAhbEnabled, TagBillTo, TagDevTeam, TagEnvironmentName, TagPurpose, TagSubEnvironmentName, TagAll | Export-Csv -Path "C:\temp\SQL Databases.csv" -NoTypeInformation -Force
-$pools  | Select-Object -Property SubscriptionId, SubscriptionName, ResourceGroupName, Location, ServerName, ElasticPoolName, Edition, SkuName, Capacity, DTU, LicenseType, IsAhbEnabled, TagBillTo, TagDevTeam, TagEnvironmentName, TagPurpose, TagSubEnvironmentName, TagAll | Export-Csv -Path "C:\temp\SQL Elastic Pools.csv" -NoTypeInformation -Force
+$who = ((Get-AzContext).account).id
+$vms    | Select-Object -Property Tenant, OfferId, SubscriptionId, SubscriptionName, ResourceGroupName, Location, Name, VmSize, CoreCount, LicenseType, OsType, IsAhbEnabled, TagBillTo, TagDevTeam, TagEnvironmentName, TagPurpose, TagSubEnvironmentName, TagAll -ExcludeProperty HardwareProfile | Export-Csv -Path "C:\temp\$who - VMs.csv" -NoTypeInformation -Force
+$dbs    | Select-Object -Property Tenant, OfferId, SubscriptionId, SubscriptionName, ResourceGroupName, Location, ServerName, DatabaseName, Edition, SkuName, ElasticPoolName, CurrentServiceObjectiveName, Capacity, LicenseType, IsAhbEnabled, TagBillTo, TagDevTeam, TagEnvironmentName, TagPurpose, TagSubEnvironmentName, TagAll | Export-Csv -Path "C:\temp\$who - SQL Databases.csv" -NoTypeInformation -Force
+$pools  | Select-Object -Property Tenant, OfferId, SubscriptionId, SubscriptionName, ResourceGroupName, Location, ServerName, ElasticPoolName, Edition, SkuName, Capacity, DTU, LicenseType, IsAhbEnabled, TagBillTo, TagDevTeam, TagEnvironmentName, TagPurpose, TagSubEnvironmentName, TagAll | Export-Csv -Path "C:\temp\$who - SQL Elastic Pools.csv" -NoTypeInformation -Force
 
 
